@@ -4969,8 +4969,8 @@ async def run_sched_group_loop(bot, group_id: int, user_id: int):
         except Exception:
             pass
 
-        # انتظر 2 ثانية بين الأحداث (ما عدا الأخير)
-        if ev_index < len(events) - 1:
+        # انتظر بين الأحداث (ما عدا الأخير) - لا انتظار في الوضع الفوري
+        if ev_index < len(events) - 1 and interval > 0:
             await asyncio.sleep(2)
 
     # ===== اكتمال جميع الأحداث: إرسال إشعار وإيقاف المجموعة =====
@@ -5179,6 +5179,7 @@ async def sched_save_events(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return "SCHED_EVENTS"
 
     kb = [
+        [InlineKeyboardButton("🚀 فوري (بدون فاصل)", callback_data="sched_interval_0")],
         [InlineKeyboardButton("⚡ 1 دقيقة", callback_data="sched_interval_1")],
         [InlineKeyboardButton("⏱ 15 دقيقة", callback_data="sched_interval_15")],
         [InlineKeyboardButton("⏱ 25 دقيقة", callback_data="sched_interval_25")],
@@ -5221,7 +5222,9 @@ async def sched_afuid_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     interval = sched["interval"]
     gaid = sched["gaid"]
 
-    if interval < 60:
+    if interval == 0:
+        interval_text = "فوري (بدون فاصل)"
+    elif interval < 60:
         interval_text = f"{interval} دقيقة"
     else:
         interval_text = f"{interval // 60} ساعة"
@@ -5297,7 +5300,7 @@ async def sched_my_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for g in groups:
         gid, platform, game_name, events_order, interval, gaid, af_uid, status, next_run = g
         status_emoji = "🟢" if status == "active" else "🔴"
-        interval_text = f"{interval}د" if interval < 60 else f"{interval // 60}س"
+        interval_text = "فوري" if interval == 0 else (f"{interval}د" if interval < 60 else f"{interval // 60}س")
         kb.append([InlineKeyboardButton(
             f"{status_emoji} [{gid}] {game_name} ({platform.upper()}) {interval_text}",
             callback_data=f"sched_group_info_{gid}"
@@ -5329,7 +5332,7 @@ async def sched_group_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         events_text = events_order_raw
 
-    interval_text = f"{interval} دقيقة" if interval < 60 else f"{interval // 60} ساعة"
+    interval_text = "فوري (بدون فاصل)" if interval == 0 else (f"{interval} دقيقة" if interval < 60 else f"{interval // 60} ساعة")
     status_text = "🟢 نشطة" if status == "active" else "🔴 متوقفة"
     next_run_short = next_run[:16] if next_run else "-"
 
