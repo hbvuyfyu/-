@@ -4893,131 +4893,107 @@ def get_sched_groups(user_id: int):
 
 # ==================== حلقة التنفيذ الرئيسية لكل مجموعة ====================
 async def run_sched_group_loop(bot, group_id: int, user_id: int):
-    """حلقة لا نهائية تنفذ أحداث المجموعة وتعرض عداً تنازلياً بين الدورات"""
+    """تنفذ أحداث المجموعة مرة واحدة بالترتيب ثم تتوقف تلقائياً"""
     loop = asyncio.get_event_loop()
-    while True:
-        # جلب بيانات المجموعة من DB
-        g = c_main.execute(
-            "SELECT platform, game_name, game_pkg, game_key, events_order, interval_minutes, gaid, af_uid, status FROM sched_groups WHERE id = ?",
-            (group_id,)
-        ).fetchone()
-        if not g or g[8] != 'active':
-            break
 
-        platform, game_name, game_pkg, game_key, events_order_raw, interval, gaid, af_uid, _ = g
+    # جلب بيانات المجموعة من DB
+    g = c_main.execute(
+        "SELECT platform, game_name, game_pkg, game_key, events_order, interval_minutes, gaid, af_uid, status FROM sched_groups WHERE id = ?",
+        (group_id,)
+    ).fetchone()
+    if not g or g[8] != 'active':
+        with sched_tasks_lock:
+            sched_active_tasks.pop(group_id, None)
+        return
+
+    platform, game_name, game_pkg, game_key, events_order_raw, interval, gaid, af_uid, _ = g
+    try:
+        events = json.loads(events_order_raw)
+    except Exception:
+        with sched_tasks_lock:
+            sched_active_tasks.pop(group_id, None)
+        return
+
+    proxy = get_proxy_for_user(user_id)
+
+    # ===== إرسال الأحداث بالترتيب (مرة واحدة فقط) =====
+    for ev_index, (ev_id, ev_name) in enumerate(events):
+        # تحقق إذا تم الإيقاف أثناء التنفيذ
+        status_row = c_main.execute("SELECT status FROM sched_groups WHERE id = ?", (group_id,)).fetchone()
+        if not status_row or status_row[0] != 'active':
+            with sched_tasks_lock:
+                sched_active_tasks.pop(group_id, None)
+            return
+
+        status_code = 0
         try:
-            events = json.loads(events_order_raw)
-        except Exception:
-            break
-
-        proxy = get_proxy_for_user(user_id)
-        interval_seconds = interval * 60
-
-        # ===== إرسال الأحداث بالترتيب =====
-        for ev_index, (ev_id, ev_name) in enumerate(events):
-            # تحقق إذا تم الإيقاف
-            status_row = c_main.execute("SELECT status FROM sched_groups WHERE id = ?", (group_id,)).fetchone()
-            if not status_row or status_row[0] != 'active':
-                return
-
+            if platform == "adj":
+                ev_row = c_main.execute("SELECT event_token FROM events_adj WHERE id = ?", (ev_id,)).fetchone()
+                if ev_row:
+                    status_code, resp = await loop.run_in_executor(
+                        None, lambda t=ev_row[0]: send_adj(game_key, t, gaid, proxy)
+                    )
+            elif platform == "singular":
+                ev_row = c_main.execute("SELECT event_name FROM events_singular WHERE id = ?", (ev_id,)).fetchone()
+                if ev_row:
+                    status_code, resp = await loop.run_in_executor(
+                        None, lambda e=ev_row[0]: send_singular(e, gaid, af_uid, game_pkg, game_key, proxy=proxy)
+                    )
+            else:  # af
+                ev_row = c_main.execute("SELECT event_name FROM events_af WHERE id = ?", (ev_id,)).fetchone()
+                if ev_row:
+                    status_code, resp = await loop.run_in_executor(
+                        None, lambda e=ev_row[0]: send_af(game_pkg, game_key, gaid, af_uid, e, proxy=proxy)
+                    )
+        except Exception as ex:
             status_code = 0
-            try:
-                if platform == "adj":
-                    ev_row = c_main.execute("SELECT event_token FROM events_adj WHERE id = ?", (ev_id,)).fetchone()
-                    if ev_row:
-                        status_code, resp = await loop.run_in_executor(
-                            None, lambda t=ev_row[0]: send_adj(game_key, t, gaid, proxy)
-                        )
-                elif platform == "singular":
-                    ev_row = c_main.execute("SELECT event_name FROM events_singular WHERE id = ?", (ev_id,)).fetchone()
-                    if ev_row:
-                        status_code, resp = await loop.run_in_executor(
-                            None, lambda e=ev_row[0]: send_singular(e, gaid, af_uid, game_pkg, game_key, proxy=proxy)
-                        )
-                else:  # af
-                    ev_row = c_main.execute("SELECT event_name FROM events_af WHERE id = ?", (ev_id,)).fetchone()
-                    if ev_row:
-                        status_code, resp = await loop.run_in_executor(
-                            None, lambda e=ev_row[0]: send_af(game_pkg, game_key, gaid, af_uid, e, proxy=proxy)
-                        )
-            except Exception as ex:
-                status_code = 0
-                resp = str(ex)
+            resp = str(ex)
 
-            result_emoji = "✅" if status_code == 200 else "❌"
-            try:
-                await bot.send_message(
-                    chat_id=user_id,
-                    text=(
-                        f"{result_emoji} *إرسال تلقائي*\n\n"
-                        f"🎮 *اللعبة:* `{game_name}`\n"
-                        f"🎯 *الحدث:* `{ev_name}`\n"
-                        f"🔹 *المنصة:* `{platform.upper()}`\n"
-                        f"📱 *GAID:* `{gaid}`\n"
-                        f"🔑 *AF UID:* `{af_uid}`\n"
-                        f"📊 *الحالة:* `HTTP {status_code}`\n"
-                        f"🕐 *الوقت:* `{datetime.now().strftime('%H:%M:%S')}`"
-                    ),
-                    parse_mode="Markdown"
-                )
-                increment_user_requests(user_id)
-            except Exception:
-                pass
-
-            # انتظر 2 ثانية بين الأحداث (ما عدا الأخير)
-            if ev_index < len(events) - 1:
-                await asyncio.sleep(2)
-
-        # ===== تحديث next_run في DB =====
-        next_run_dt = datetime.now() + timedelta(seconds=interval_seconds)
-        c_main.execute("UPDATE sched_groups SET next_run = ? WHERE id = ?", (next_run_dt.isoformat(), group_id))
-        conn_main.commit()
-
-        # ===== عداد تنازلي =====
+        result_emoji = "✅" if status_code == 200 else "❌"
         try:
-            countdown_msg = await bot.send_message(
+            await bot.send_message(
                 chat_id=user_id,
-                text=f"⏳ *الدورة القادمة خلال {interval} {'دقيقة' if interval < 60 else 'ساعة'}...*",
+                text=(
+                    f"{result_emoji} *إرسال تلقائي*\n\n"
+                    f"🎮 *اللعبة:* `{game_name}`\n"
+                    f"🎯 *الحدث:* `{ev_name}`\n"
+                    f"🔹 *المنصة:* `{platform.upper()}`\n"
+                    f"📱 *GAID:* `{gaid}`\n"
+                    f"🔑 *AF UID:* `{af_uid}`\n"
+                    f"📊 *الحالة:* `HTTP {status_code}`\n"
+                    f"🕐 *الوقت:* `{datetime.now().strftime('%H:%M:%S')}`"
+                ),
                 parse_mode="Markdown"
             )
+            increment_user_requests(user_id)
         except Exception:
-            countdown_msg = None
+            pass
 
-        elapsed = 0
-        update_interval = 10 if interval_seconds <= 120 else 30
-        while elapsed < interval_seconds:
-            await asyncio.sleep(update_interval)
-            elapsed += update_interval
-            # تحقق إذا تم الإيقاف
-            status_row = c_main.execute("SELECT status FROM sched_groups WHERE id = ?", (group_id,)).fetchone()
-            if not status_row or status_row[0] != 'active':
-                if countdown_msg:
-                    try:
-                        await countdown_msg.edit_text("⏹ *تم إيقاف الجدولة*", parse_mode="Markdown")
-                    except Exception:
-                        pass
-                return
-            remaining = max(0, interval_seconds - elapsed)
-            if remaining == 0:
-                break
-            if countdown_msg:
-                remaining_min = remaining // 60
-                remaining_sec = remaining % 60
-                try:
-                    await countdown_msg.edit_text(
-                        f"⏳ *الدورة القادمة خلال {remaining_min}د {remaining_sec:02d}ث*",
-                        parse_mode="Markdown"
-                    )
-                except Exception:
-                    pass
+        # انتظر 2 ثانية بين الأحداث (ما عدا الأخير)
+        if ev_index < len(events) - 1:
+            await asyncio.sleep(2)
 
-        if countdown_msg:
-            try:
-                await countdown_msg.delete()
-            except Exception:
-                pass
+    # ===== اكتمال جميع الأحداث: إرسال إشعار وإيقاف المجموعة =====
+    try:
+        events_summary = "\n".join([f"{i+1}. {e[1]}" for i, e in enumerate(events)])
+        await bot.send_message(
+            chat_id=user_id,
+            text=(
+                f"🎉 *تم اكتمال جميع المهام!*\n\n"
+                f"🎮 *اللعبة:* `{game_name}`\n"
+                f"🔹 *المنصة:* `{platform.upper()}`\n"
+                f"📋 *الأحداث المنفذة:*\n{events_summary}\n"
+                f"🕐 *وقت الاكتمال:* `{datetime.now().strftime('%H:%M:%S')}`\n\n"
+                f"⏹ تم إيقاف المجموعة تلقائياً."
+            ),
+            parse_mode="Markdown"
+        )
+    except Exception:
+        pass
 
-    # عند الانتهاء/الإيقاف
+    # إيقاف المجموعة تلقائياً
+    c_main.execute("UPDATE sched_groups SET status = 'stopped' WHERE id = ?", (group_id,))
+    conn_main.commit()
     with sched_tasks_lock:
         sched_active_tasks.pop(group_id, None)
 
