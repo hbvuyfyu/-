@@ -4860,9 +4860,9 @@ async def proxy_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #                         جدولة العمليات (الجديدة)
 # ==================================================================================
 
-# جدول لحفظ الجلسات المجدولة في الذاكرة: {user_id: {task_id: task_info}}
-scheduled_sessions: Dict[int, Dict] = {}
-scheduled_sessions_lock = threading.Lock()
+# جدول لتتبع مهام asyncio النشطة: {group_id: asyncio.Task}
+sched_active_tasks: Dict[int, "asyncio.Task"] = {}
+sched_tasks_lock = threading.Lock()
 
 # إنشاء جدول جلسات الجدولة في قاعدة البيانات
 c_main.execute('''CREATE TABLE IF NOT EXISTS sched_groups (
@@ -4891,6 +4891,152 @@ def get_sched_groups(user_id: int):
         (user_id,)
     ).fetchall()
 
+# ==================== حلقة التنفيذ الرئيسية لكل مجموعة ====================
+async def run_sched_group_loop(bot, group_id: int, user_id: int):
+    """حلقة لا نهائية تنفذ أحداث المجموعة وتعرض عداً تنازلياً بين الدورات"""
+    loop = asyncio.get_event_loop()
+    while True:
+        # جلب بيانات المجموعة من DB
+        g = c_main.execute(
+            "SELECT platform, game_name, game_pkg, game_key, events_order, interval_minutes, gaid, af_uid, status FROM sched_groups WHERE id = ?",
+            (group_id,)
+        ).fetchone()
+        if not g or g[8] != 'active':
+            break
+
+        platform, game_name, game_pkg, game_key, events_order_raw, interval, gaid, af_uid, _ = g
+        try:
+            events = json.loads(events_order_raw)
+        except Exception:
+            break
+
+        proxy = get_proxy_for_user(user_id)
+        interval_seconds = interval * 60
+
+        # ===== إرسال الأحداث بالترتيب =====
+        for ev_index, (ev_id, ev_name) in enumerate(events):
+            # تحقق إذا تم الإيقاف
+            status_row = c_main.execute("SELECT status FROM sched_groups WHERE id = ?", (group_id,)).fetchone()
+            if not status_row or status_row[0] != 'active':
+                return
+
+            status_code = 0
+            try:
+                if platform == "adj":
+                    ev_row = c_main.execute("SELECT event_token FROM events_adj WHERE id = ?", (ev_id,)).fetchone()
+                    if ev_row:
+                        status_code, resp = await loop.run_in_executor(
+                            None, lambda t=ev_row[0]: send_adj(game_key, t, gaid, proxy)
+                        )
+                elif platform == "singular":
+                    ev_row = c_main.execute("SELECT event_name FROM events_singular WHERE id = ?", (ev_id,)).fetchone()
+                    if ev_row:
+                        status_code, resp = await loop.run_in_executor(
+                            None, lambda e=ev_row[0]: send_singular(e, gaid, af_uid, game_pkg, game_key, proxy=proxy)
+                        )
+                else:  # af
+                    ev_row = c_main.execute("SELECT event_name FROM events_af WHERE id = ?", (ev_id,)).fetchone()
+                    if ev_row:
+                        status_code, resp = await loop.run_in_executor(
+                            None, lambda e=ev_row[0]: send_af(game_pkg, game_key, gaid, af_uid, e, proxy=proxy)
+                        )
+            except Exception as ex:
+                status_code = 0
+                resp = str(ex)
+
+            result_emoji = "✅" if status_code == 200 else "❌"
+            try:
+                await bot.send_message(
+                    chat_id=user_id,
+                    text=(
+                        f"{result_emoji} *إرسال تلقائي*\n\n"
+                        f"🎮 *اللعبة:* `{game_name}`\n"
+                        f"🎯 *الحدث:* `{ev_name}`\n"
+                        f"🔹 *المنصة:* `{platform.upper()}`\n"
+                        f"📱 *GAID:* `{gaid}`\n"
+                        f"🔑 *AF UID:* `{af_uid}`\n"
+                        f"📊 *الحالة:* `HTTP {status_code}`\n"
+                        f"🕐 *الوقت:* `{datetime.now().strftime('%H:%M:%S')}`"
+                    ),
+                    parse_mode="Markdown"
+                )
+                increment_user_requests(user_id)
+            except Exception:
+                pass
+
+            # انتظر 2 ثانية بين الأحداث (ما عدا الأخير)
+            if ev_index < len(events) - 1:
+                await asyncio.sleep(2)
+
+        # ===== تحديث next_run في DB =====
+        next_run_dt = datetime.now() + timedelta(seconds=interval_seconds)
+        c_main.execute("UPDATE sched_groups SET next_run = ? WHERE id = ?", (next_run_dt.isoformat(), group_id))
+        conn_main.commit()
+
+        # ===== عداد تنازلي =====
+        try:
+            countdown_msg = await bot.send_message(
+                chat_id=user_id,
+                text=f"⏳ *الدورة القادمة خلال {interval} {'دقيقة' if interval < 60 else 'ساعة'}...*",
+                parse_mode="Markdown"
+            )
+        except Exception:
+            countdown_msg = None
+
+        elapsed = 0
+        update_interval = 10 if interval_seconds <= 120 else 30
+        while elapsed < interval_seconds:
+            await asyncio.sleep(update_interval)
+            elapsed += update_interval
+            # تحقق إذا تم الإيقاف
+            status_row = c_main.execute("SELECT status FROM sched_groups WHERE id = ?", (group_id,)).fetchone()
+            if not status_row or status_row[0] != 'active':
+                if countdown_msg:
+                    try:
+                        await countdown_msg.edit_text("⏹ *تم إيقاف الجدولة*", parse_mode="Markdown")
+                    except Exception:
+                        pass
+                return
+            remaining = max(0, interval_seconds - elapsed)
+            if remaining == 0:
+                break
+            if countdown_msg:
+                remaining_min = remaining // 60
+                remaining_sec = remaining % 60
+                try:
+                    await countdown_msg.edit_text(
+                        f"⏳ *الدورة القادمة خلال {remaining_min}د {remaining_sec:02d}ث*",
+                        parse_mode="Markdown"
+                    )
+                except Exception:
+                    pass
+
+        if countdown_msg:
+            try:
+                await countdown_msg.delete()
+            except Exception:
+                pass
+
+    # عند الانتهاء/الإيقاف
+    with sched_tasks_lock:
+        sched_active_tasks.pop(group_id, None)
+
+def start_sched_task(bot, group_id: int, user_id: int):
+    """يُنشئ asyncio.Task للمجموعة ويسجلها"""
+    with sched_tasks_lock:
+        if group_id in sched_active_tasks and not sched_active_tasks[group_id].done():
+            return  # تعمل بالفعل
+        task = asyncio.create_task(run_sched_group_loop(bot, group_id, user_id))
+        sched_active_tasks[group_id] = task
+
+def stop_sched_task(group_id: int):
+    """يوقف Task المجموعة"""
+    with sched_tasks_lock:
+        task = sched_active_tasks.pop(group_id, None)
+        if task and not task.done():
+            task.cancel()
+
+# ==================== معالجات Telegram ====================
 async def sched_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -4900,8 +5046,7 @@ async def sched_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🔙 رجوع", callback_data="main")],
     ]
     await query.edit_message_text(
-        "⏰ *جدولة العمليات*\n\n"
-        "اختر خيار من القائمة أدناه:",
+        "⏰ *جدولة العمليات*\n\nاختر خيار من القائمة أدناه:",
         reply_markup=InlineKeyboardMarkup(kb),
         parse_mode="Markdown"
     )
@@ -4927,8 +5072,7 @@ async def sched_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def sched_platform_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    data = query.data
-    platform = data.replace("sched_platform_", "")
+    platform = query.data.replace("sched_platform_", "")
     context.user_data["sched"]["platform"] = platform
 
     if platform == "adj":
@@ -5012,10 +5156,11 @@ async def sched_show_events(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     kb = []
     for ev_id, ev_name in ev_list:
-        order_num = ""
         if ev_id in selected_ids:
-            order_num = f" [{selected_ids.index(ev_id) + 1}]"
-        btn_text = f"{'✅' if ev_id in selected_ids else '⬜'} {ev_name}{order_num}"
+            order_num = selected_ids.index(ev_id) + 1
+            btn_text = f"✅ [{order_num}] {ev_name}"
+        else:
+            btn_text = f"⬜ {ev_name}"
         kb.append([InlineKeyboardButton(btn_text, callback_data=f"sched_ev_{ev_id}")])
 
     if selected:
@@ -5058,6 +5203,7 @@ async def sched_save_events(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return "SCHED_EVENTS"
 
     kb = [
+        [InlineKeyboardButton("⚡ 1 دقيقة", callback_data="sched_interval_1")],
         [InlineKeyboardButton("⏱ 15 دقيقة", callback_data="sched_interval_15")],
         [InlineKeyboardButton("⏱ 25 دقيقة", callback_data="sched_interval_25")],
         [InlineKeyboardButton("⏱ 1 ساعة", callback_data="sched_interval_60")],
@@ -5065,7 +5211,7 @@ async def sched_save_events(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🔙 رجوع", callback_data="sched_back_events")],
     ]
     await query.edit_message_text(
-        "⏰ *اختر الفاصل الزمني بين كل حدث:*",
+        "⏰ *اختر الفاصل الزمني بين كل دورة:*",
         reply_markup=InlineKeyboardMarkup(kb),
         parse_mode="Markdown"
     )
@@ -5077,8 +5223,7 @@ async def sched_interval_select(update: Update, context: ContextTypes.DEFAULT_TY
     minutes = int(query.data.replace("sched_interval_", ""))
     context.user_data["sched"]["interval"] = minutes
     await query.edit_message_text(
-        "📱 *أدخل GAID:*\n\n"
-        "مثال: `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`",
+        "📱 *أدخل GAID:*\n\nمثال: `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`",
         parse_mode="Markdown"
     )
     return "SCHED_GAID"
@@ -5086,10 +5231,7 @@ async def sched_interval_select(update: Update, context: ContextTypes.DEFAULT_TY
 async def sched_gaid_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     gaid = update.message.text.strip()
     context.user_data["sched"]["gaid"] = gaid
-    await update.message.reply_text(
-        "🔑 *أدخل AF UID:*",
-        parse_mode="Markdown"
-    )
+    await update.message.reply_text("🔑 *أدخل AF UID:*", parse_mode="Markdown")
     return "SCHED_AFUID"
 
 async def sched_afuid_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5103,7 +5245,11 @@ async def sched_afuid_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     interval = sched["interval"]
     gaid = sched["gaid"]
 
-    interval_text = f"{interval} دقيقة" if interval < 60 else f"{interval // 60} ساعة"
+    if interval < 60:
+        interval_text = f"{interval} دقيقة"
+    else:
+        interval_text = f"{interval // 60} ساعة"
+
     events_text = "\n".join([f"{i+1}. {e[1]}" for i, e in enumerate(events)])
 
     kb = [
@@ -5112,12 +5258,12 @@ async def sched_afuid_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     await update.message.reply_text(
         f"📋 *تفاصيل الخطة:*\n\n"
-        f"🔹 المنصة: `{platform.upper()}`\n"
-        f"🎮 اللعبة: `{game_name}`\n"
-        f"🎯 الأحداث بالترتيب:\n{events_text}\n"
-        f"⏰ الفاصل الزمني: `{interval_text}`\n"
-        f"📱 GAID: `{gaid}`\n"
-        f"🔑 AF UID: `{af_uid}`",
+        f"🔹 *المنصة:* `{platform.upper()}`\n"
+        f"🎮 *اللعبة:* `{game_name}`\n"
+        f"🎯 *الأحداث بالترتيب:*\n{events_text}\n"
+        f"⏰ *الفاصل الزمني:* `{interval_text}`\n"
+        f"📱 *GAID:* `{gaid}`\n"
+        f"🔑 *AF UID:* `{af_uid}`",
         reply_markup=InlineKeyboardMarkup(kb),
         parse_mode="Markdown"
     )
@@ -5141,22 +5287,23 @@ async def sched_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     events_order = json.dumps([(e[0], e[1]) for e in events], ensure_ascii=False)
     now = datetime.now().isoformat()
-    # next_run = now حتى يبدأ التنفيذ فوراً
-    next_run = now
 
     c_main.execute(
         "INSERT INTO sched_groups (user_id, platform, game_id, game_name, game_pkg, game_key, events_order, interval_minutes, gaid, af_uid, status, created_date, next_run) VALUES (?,?,?,?,?,?,?,?,?,?,'active',?,?)",
-        (uid, platform, game_id, game_name, game_pkg, game_key, events_order, interval, gaid, af_uid, now, next_run)
+        (uid, platform, game_id, game_name, game_pkg, game_key, events_order, interval, gaid, af_uid, now, now)
     )
     conn_main.commit()
     group_id = c_main.execute("SELECT last_insert_rowid()").fetchone()[0]
 
     await query.edit_message_text(
-        "✅ *تم تفعيل الجدولة!*\n\n"
+        f"✅ *تم تفعيل الجدولة!*\n\n"
         f"🆔 معرف المجموعة: `{group_id}`\n"
-        "⏳ سيبدأ الإرسال التلقائي خلال دقيقة وسيصلك إشعار عند كل إرسال.",
+        f"🚀 يبدأ الإرسال الآن...",
         parse_mode="Markdown"
     )
+
+    # ابدأ التنفيذ فوراً
+    start_sched_task(context.bot, group_id, uid)
     return -1
 
 async def sched_my_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5181,11 +5328,7 @@ async def sched_my_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )])
 
     kb.append([InlineKeyboardButton("🔙 رجوع", callback_data="sched_menu")])
-    await query.edit_message_text(
-        "📋 *مجموعاتي:*",
-        reply_markup=InlineKeyboardMarkup(kb),
-        parse_mode="Markdown"
-    )
+    await query.edit_message_text("📋 *مجموعاتي:*", reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
     return "SCHED_GROUPS"
 
 async def sched_group_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5215,20 +5358,21 @@ async def sched_group_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     next_run_short = next_run[:16] if next_run else "-"
 
     kb = [
-        [InlineKeyboardButton("⏹ إيقاف", callback_data=f"sched_stop_{gid}"), InlineKeyboardButton("▶️ تفعيل", callback_data=f"sched_activate_{gid}")],
+        [InlineKeyboardButton("⏹ إيقاف", callback_data=f"sched_stop_{gid}"),
+         InlineKeyboardButton("▶️ تفعيل", callback_data=f"sched_activate_{gid}")],
         [InlineKeyboardButton("🗑 حذف", callback_data=f"sched_delete_{gid}")],
         [InlineKeyboardButton("🔙 رجوع", callback_data="sched_my_groups")],
     ]
     await query.edit_message_text(
         f"📋 *تفاصيل المجموعة [{gid}]:*\n\n"
-        f"🔹 المنصة: `{platform.upper()}`\n"
-        f"🎮 اللعبة: `{game_name}`\n"
-        f"🎯 الأحداث:\n{events_text}\n"
-        f"⏰ الفاصل: `{interval_text}`\n"
-        f"📱 GAID: `{gaid}`\n"
-        f"🔑 AF UID: `{af_uid}`\n"
-        f"📊 الحالة: {status_text}\n"
-        f"⏭ التنفيذ التالي: `{next_run_short}`",
+        f"🔹 *المنصة:* `{platform.upper()}`\n"
+        f"🎮 *اللعبة:* `{game_name}`\n"
+        f"🎯 *الأحداث:*\n{events_text}\n"
+        f"⏰ *الفاصل:* `{interval_text}`\n"
+        f"📱 *GAID:* `{gaid}`\n"
+        f"🔑 *AF UID:* `{af_uid}`\n"
+        f"📊 *الحالة:* {status_text}\n"
+        f"⏭ *التنفيذ التالي:* `{next_run_short}`",
         reply_markup=InlineKeyboardMarkup(kb),
         parse_mode="Markdown"
     )
@@ -5241,6 +5385,7 @@ async def sched_stop_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = query.from_user.id
     c_main.execute("UPDATE sched_groups SET status = 'stopped' WHERE id = ? AND user_id = ?", (gid, uid))
     conn_main.commit()
+    stop_sched_task(gid)
     await query.answer("✅ تم الإيقاف", show_alert=True)
     return await sched_group_info(update, context)
 
@@ -5249,9 +5394,10 @@ async def sched_activate_group(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.answer()
     gid = int(query.data.replace("sched_activate_", ""))
     uid = query.from_user.id
-    next_run = (datetime.now() + timedelta(minutes=1)).isoformat()
-    c_main.execute("UPDATE sched_groups SET status = 'active', next_run = ? WHERE id = ? AND user_id = ?", (next_run, gid, uid))
+    now = datetime.now().isoformat()
+    c_main.execute("UPDATE sched_groups SET status = 'active', next_run = ? WHERE id = ? AND user_id = ?", (now, gid, uid))
     conn_main.commit()
+    start_sched_task(context.bot, gid, uid)
     await query.answer("✅ تم التفعيل", show_alert=True)
     return await sched_group_info(update, context)
 
@@ -5260,6 +5406,7 @@ async def sched_delete_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await query.answer()
     gid = int(query.data.replace("sched_delete_", ""))
     uid = query.from_user.id
+    stop_sched_task(gid)
     c_main.execute("DELETE FROM sched_groups WHERE id = ? AND user_id = ?", (gid, uid))
     conn_main.commit()
     await query.edit_message_text("✅ *تم حذف المجموعة*", parse_mode="Markdown")
@@ -5270,86 +5417,19 @@ async def sched_back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await query.answer()
     return await sched_menu(update, context)
 
-# ==================== الجدول التلقائي لتنفيذ مجموعات الجدولة ====================
 async def sched_runner(context: ContextTypes.DEFAULT_TYPE):
-    """يعمل كل دقيقة، يفحص المجموعات النشطة وينفذها عند حلول موعدها"""
-    loop = asyncio.get_event_loop()
-    now = datetime.now()
+    """يعمل عند بدء البوت لإعادة تشغيل المجموعات النشطة التي لها next_run منتهي"""
     try:
+        now = datetime.now()
         groups = c_main.execute(
-            "SELECT id, user_id, platform, game_id, game_name, game_pkg, game_key, events_order, interval_minutes, gaid, af_uid FROM sched_groups WHERE status = 'active' AND next_run <= ?",
-            (now.isoformat(),)
+            "SELECT id, user_id FROM sched_groups WHERE status = 'active'",
         ).fetchall()
+        for gid, uid in groups:
+            start_sched_task(context.bot, gid, uid)
     except Exception as e:
-        logger.error(f"sched_runner DB error: {e}")
-        return
+        logger.error(f"sched_runner startup error: {e}")
 
-    for g in groups:
-        gid, user_id, platform, game_id, game_name, game_pkg, game_key, events_order_raw, interval, gaid, af_uid = g
-        try:
-            events = json.loads(events_order_raw)
-        except Exception:
-            logger.error(f"sched_runner bad events_order for group {gid}")
-            continue
 
-        proxy = get_proxy_for_user(user_id)
-
-        # حدّث next_run مسبقاً لتجنب التكرار في حال البطء
-        next_run = (datetime.now() + timedelta(minutes=interval)).isoformat()
-        c_main.execute("UPDATE sched_groups SET next_run = ? WHERE id = ?", (next_run, gid))
-        conn_main.commit()
-
-        for ev_index, (ev_id, ev_name) in enumerate(events):
-            try:
-                if platform == "adj":
-                    ev_row = c_main.execute("SELECT event_token FROM events_adj WHERE id = ?", (ev_id,)).fetchone()
-                    if not ev_row:
-                        continue
-                    status_code, resp = await loop.run_in_executor(
-                        None, lambda t=ev_row[0]: send_adj(game_key, t, gaid, proxy)
-                    )
-                elif platform == "singular":
-                    ev_row = c_main.execute("SELECT event_name FROM events_singular WHERE id = ?", (ev_id,)).fetchone()
-                    if not ev_row:
-                        continue
-                    status_code, resp = await loop.run_in_executor(
-                        None, lambda e=ev_row[0]: send_singular(e, gaid, af_uid, game_pkg, game_key, proxy=proxy)
-                    )
-                else:  # af
-                    ev_row = c_main.execute("SELECT event_name FROM events_af WHERE id = ?", (ev_id,)).fetchone()
-                    if not ev_row:
-                        continue
-                    status_code, resp = await loop.run_in_executor(
-                        None, lambda e=ev_row[0]: send_af(game_pkg, game_key, gaid, af_uid, e, proxy=proxy)
-                    )
-
-                result_emoji = "✅" if status_code == 200 else "❌"
-                await context.bot.send_message(
-                    chat_id=user_id,
-                    text=(
-                        f"{result_emoji} *إرسال تلقائي*\n\n"
-                        f"🎮 اللعبة: `{game_name}`\n"
-                        f"🎯 الحدث: `{ev_name}`\n"
-                        f"🔹 المنصة: `{platform.upper()}`\n"
-                        f"📊 الحالة: `HTTP {status_code}`"
-                    ),
-                    parse_mode="Markdown"
-                )
-                increment_user_requests(user_id)
-
-                if ev_index < len(events) - 1:
-                    await asyncio.sleep(3)
-
-            except Exception as e:
-                logger.error(f"sched_runner error for group {gid} event {ev_id}: {e}")
-                try:
-                    await context.bot.send_message(
-                        chat_id=user_id,
-                        text=f"⚠️ خطأ في الإرسال التلقائي\n🎮 {game_name} - {ev_name}\n`{str(e)[:200]}`",
-                        parse_mode="Markdown"
-                    )
-                except Exception:
-                    pass
 
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
@@ -5359,7 +5439,7 @@ def main():
         job_queue = app.job_queue
         if job_queue:
             job_queue.run_repeating(farm_scheduler, interval=3600, first=10)
-            job_queue.run_repeating(sched_runner, interval=60, first=5)
+            job_queue.run_once(sched_runner, when=3)
             print("✅ جدولة المزرعة مفعلة")
         else:
             print("⚠️ JobQueue غير متاح - ميزة المزرعة العادية لن تعمل (الوضع الخاص يعمل بدونها)")
