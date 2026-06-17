@@ -29,8 +29,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ==================== ثوابت البوت ====================
-BOT_TOKEN = "8860414927:AAGxO3Pdyq-ZaIL6ZFJOerYnWhtef3JxGXA"
-ADMIN_IDS = [6075014046, 5697155314, 8114043468]
+BOT_TOKEN = "8931707338:AAHDZ9eHbBXnYzynzt8KuCYlAKq0Uxivz4w"
+ADMIN_IDS = "8312300160"
 SUPPORT_USER = "@abodnft"
 
 # إعدادات الأداء
