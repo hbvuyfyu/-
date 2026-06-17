@@ -4893,7 +4893,7 @@ def get_sched_groups(user_id: int):
 
 # ==================== حلقة التنفيذ الرئيسية لكل مجموعة ====================
 async def run_sched_group_loop(bot, group_id: int, user_id: int):
-    """تنفذ أحداث المجموعة مرة واحدة بالترتيب ثم تتوقف تلقائياً"""
+    """يرسل أحداث المجموعة بالترتيب مع فاصل زمني وعداد تنازلي بين كل حدث والتالي"""
     loop = asyncio.get_event_loop()
 
     # جلب بيانات المجموعة من DB
@@ -4915,17 +4915,20 @@ async def run_sched_group_loop(bot, group_id: int, user_id: int):
         return
 
     proxy = get_proxy_for_user(user_id)
+    interval_seconds = interval * 60  # 0 = فوري، >0 = انتظر بين الأحداث
 
-    # ===== إرسال الأحداث بالترتيب (مرة واحدة فقط) =====
+    # ===== إرسال الأحداث بالترتيب مع فاصل زمني بينها =====
     for ev_index, (ev_id, ev_name) in enumerate(events):
-        # تحقق إذا تم الإيقاف أثناء التنفيذ
+        # تحقق إذا تم الإيقاف
         status_row = c_main.execute("SELECT status FROM sched_groups WHERE id = ?", (group_id,)).fetchone()
         if not status_row or status_row[0] != 'active':
             with sched_tasks_lock:
                 sched_active_tasks.pop(group_id, None)
             return
 
+        # --- إرسال الحدث ---
         status_code = 0
+        resp = ""
         try:
             if platform == "adj":
                 ev_row = c_main.execute("SELECT event_token FROM events_adj WHERE id = ?", (ev_id,)).fetchone()
@@ -4949,7 +4952,10 @@ async def run_sched_group_loop(bot, group_id: int, user_id: int):
             status_code = 0
             resp = str(ex)
 
+        # --- إشعار بنتيجة الإرسال ---
         result_emoji = "✅" if status_code == 200 else "❌"
+        remaining_count = len(events) - ev_index - 1
+        remaining_text = f"\n⏭ *متبقي:* `{remaining_count} حدث`" if remaining_count > 0 else ""
         try:
             await bot.send_message(
                 chat_id=user_id,
@@ -4962,6 +4968,7 @@ async def run_sched_group_loop(bot, group_id: int, user_id: int):
                     f"🔑 *AF UID:* `{af_uid}`\n"
                     f"📊 *الحالة:* `HTTP {status_code}`\n"
                     f"🕐 *الوقت:* `{datetime.now().strftime('%H:%M:%S')}`"
+                    f"{remaining_text}"
                 ),
                 parse_mode="Markdown"
             )
@@ -4969,11 +4976,69 @@ async def run_sched_group_loop(bot, group_id: int, user_id: int):
         except Exception:
             pass
 
-        # انتظر بين الأحداث (ما عدا الأخير) - لا انتظار في الوضع الفوري
-        if ev_index < len(events) - 1 and interval > 0:
-            await asyncio.sleep(2)
+        # --- فاصل زمني مع عداد تنازلي بين الأحداث (ما عدا الأخير) ---
+        if ev_index < len(events) - 1:
+            if interval_seconds == 0:
+                # وضع فوري: لا انتظار
+                await asyncio.sleep(0.5)
+            else:
+                # عرض العداد التنازلي حتى الحدث التالي
+                next_ev_name = events[ev_index + 1][1]
+                if interval < 60:
+                    interval_label = f"{interval} دقيقة"
+                else:
+                    interval_label = f"{interval // 60} ساعة"
 
-    # ===== اكتمال جميع الأحداث: إرسال إشعار وإيقاف المجموعة =====
+                try:
+                    countdown_msg = await bot.send_message(
+                        chat_id=user_id,
+                        text=f"⏳ *الحدث التالي:* `{next_ev_name}`\nيُرسل خلال {interval_label}...",
+                        parse_mode="Markdown"
+                    )
+                except Exception:
+                    countdown_msg = None
+
+                # تحديث العداد كل 10 ثواني (للفترات القصيرة) أو 30 ثانية (للطويلة)
+                update_every = 10 if interval_seconds <= 120 else 30
+                elapsed = 0
+                while elapsed < interval_seconds:
+                    await asyncio.sleep(update_every)
+                    elapsed += update_every
+
+                    # تحقق إذا تم الإيقاف أثناء الانتظار
+                    status_row = c_main.execute("SELECT status FROM sched_groups WHERE id = ?", (group_id,)).fetchone()
+                    if not status_row or status_row[0] != 'active':
+                        if countdown_msg:
+                            try:
+                                await countdown_msg.edit_text("⏹ *تم إيقاف الجدولة*", parse_mode="Markdown")
+                            except Exception:
+                                pass
+                        with sched_tasks_lock:
+                            sched_active_tasks.pop(group_id, None)
+                        return
+
+                    remaining = max(0, interval_seconds - elapsed)
+                    if remaining == 0:
+                        break
+                    if countdown_msg:
+                        remaining_min = remaining // 60
+                        remaining_sec = remaining % 60
+                        try:
+                            await countdown_msg.edit_text(
+                                f"⏳ *الحدث التالي:* `{next_ev_name}`\n"
+                                f"يُرسل خلال {remaining_min}د {remaining_sec:02d}ث",
+                                parse_mode="Markdown"
+                            )
+                        except Exception:
+                            pass
+
+                if countdown_msg:
+                    try:
+                        await countdown_msg.delete()
+                    except Exception:
+                        pass
+
+    # ===== اكتمال جميع الأحداث: إشعار وإيقاف تلقائي =====
     try:
         events_summary = "\n".join([f"{i+1}. {e[1]}" for i, e in enumerate(events)])
         await bot.send_message(
@@ -4996,7 +5061,6 @@ async def run_sched_group_loop(bot, group_id: int, user_id: int):
     conn_main.commit()
     with sched_tasks_lock:
         sched_active_tasks.pop(group_id, None)
-
 def start_sched_task(bot, group_id: int, user_id: int):
     """يُنشئ asyncio.Task للمجموعة ويسجلها"""
     with sched_tasks_lock:
