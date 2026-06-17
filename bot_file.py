@@ -5141,7 +5141,8 @@ async def sched_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     events_order = json.dumps([(e[0], e[1]) for e in events], ensure_ascii=False)
     now = datetime.now().isoformat()
-    next_run = (datetime.now() + timedelta(minutes=interval)).isoformat()
+    # next_run = now حتى يبدأ التنفيذ فوراً
+    next_run = now
 
     c_main.execute(
         "INSERT INTO sched_groups (user_id, platform, game_id, game_name, game_pkg, game_key, events_order, interval_minutes, gaid, af_uid, status, created_date, next_run) VALUES (?,?,?,?,?,?,?,?,?,?,'active',?,?)",
@@ -5153,7 +5154,7 @@ async def sched_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(
         "✅ *تم تفعيل الجدولة!*\n\n"
         f"🆔 معرف المجموعة: `{group_id}`\n"
-        "البوت سيبدأ بتنفيذ الطلبات تلقائياً وسيصلك إشعار عند كل إرسال.",
+        "⏳ سيبدأ الإرسال التلقائي خلال دقيقة وسيصلك إشعار عند كل إرسال.",
         parse_mode="Markdown"
     )
     return -1
@@ -5272,38 +5273,55 @@ async def sched_back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # ==================== الجدول التلقائي لتنفيذ مجموعات الجدولة ====================
 async def sched_runner(context: ContextTypes.DEFAULT_TYPE):
     """يعمل كل دقيقة، يفحص المجموعات النشطة وينفذها عند حلول موعدها"""
+    loop = asyncio.get_event_loop()
     now = datetime.now()
-    groups = c_main.execute(
-        "SELECT id, user_id, platform, game_id, game_name, game_pkg, game_key, events_order, interval_minutes, gaid, af_uid FROM sched_groups WHERE status = 'active' AND next_run <= ?",
-        (now.isoformat(),)
-    ).fetchall()
+    try:
+        groups = c_main.execute(
+            "SELECT id, user_id, platform, game_id, game_name, game_pkg, game_key, events_order, interval_minutes, gaid, af_uid FROM sched_groups WHERE status = 'active' AND next_run <= ?",
+            (now.isoformat(),)
+        ).fetchall()
+    except Exception as e:
+        logger.error(f"sched_runner DB error: {e}")
+        return
 
     for g in groups:
         gid, user_id, platform, game_id, game_name, game_pkg, game_key, events_order_raw, interval, gaid, af_uid = g
         try:
             events = json.loads(events_order_raw)
         except Exception:
+            logger.error(f"sched_runner bad events_order for group {gid}")
             continue
 
         proxy = get_proxy_for_user(user_id)
 
-        for idx, (ev_id, ev_name) in enumerate(events):
+        # حدّث next_run مسبقاً لتجنب التكرار في حال البطء
+        next_run = (datetime.now() + timedelta(minutes=interval)).isoformat()
+        c_main.execute("UPDATE sched_groups SET next_run = ? WHERE id = ?", (next_run, gid))
+        conn_main.commit()
+
+        for ev_index, (ev_id, ev_name) in enumerate(events):
             try:
                 if platform == "adj":
-                    ev = c_main.execute("SELECT event_token FROM events_adj WHERE id = ?", (ev_id,)).fetchone()
-                    if not ev:
+                    ev_row = c_main.execute("SELECT event_token FROM events_adj WHERE id = ?", (ev_id,)).fetchone()
+                    if not ev_row:
                         continue
-                    status_code, resp = send_adj(game_key, ev[0], gaid, proxy)
+                    status_code, resp = await loop.run_in_executor(
+                        None, lambda t=ev_row[0]: send_adj(game_key, t, gaid, proxy)
+                    )
                 elif platform == "singular":
-                    ev = c_main.execute("SELECT event_name FROM events_singular WHERE id = ?", (ev_id,)).fetchone()
-                    if not ev:
+                    ev_row = c_main.execute("SELECT event_name FROM events_singular WHERE id = ?", (ev_id,)).fetchone()
+                    if not ev_row:
                         continue
-                    status_code, resp = send_singular(ev[0], gaid, af_uid, game_pkg, game_key, proxy=proxy)
+                    status_code, resp = await loop.run_in_executor(
+                        None, lambda e=ev_row[0]: send_singular(e, gaid, af_uid, game_pkg, game_key, proxy=proxy)
+                    )
                 else:  # af
-                    ev = c_main.execute("SELECT event_name FROM events_af WHERE id = ?", (ev_id,)).fetchone()
-                    if not ev:
+                    ev_row = c_main.execute("SELECT event_name FROM events_af WHERE id = ?", (ev_id,)).fetchone()
+                    if not ev_row:
                         continue
-                    status_code, resp = send_af(game_pkg, game_key, gaid, af_uid, ev[0], proxy=proxy)
+                    status_code, resp = await loop.run_in_executor(
+                        None, lambda e=ev_row[0]: send_af(game_pkg, game_key, gaid, af_uid, e, proxy=proxy)
+                    )
 
                 result_emoji = "✅" if status_code == 200 else "❌"
                 await context.bot.send_message(
@@ -5319,15 +5337,19 @@ async def sched_runner(context: ContextTypes.DEFAULT_TYPE):
                 )
                 increment_user_requests(user_id)
 
-                if idx < len(events) - 1:
-                    await asyncio.sleep(2)
+                if ev_index < len(events) - 1:
+                    await asyncio.sleep(3)
 
             except Exception as e:
                 logger.error(f"sched_runner error for group {gid} event {ev_id}: {e}")
-
-        next_run = (datetime.now() + timedelta(minutes=interval)).isoformat()
-        c_main.execute("UPDATE sched_groups SET next_run = ? WHERE id = ?", (next_run, gid))
-        conn_main.commit()
+                try:
+                    await context.bot.send_message(
+                        chat_id=user_id,
+                        text=f"⚠️ خطأ في الإرسال التلقائي\n🎮 {game_name} - {ev_name}\n`{str(e)[:200]}`",
+                        parse_mode="Markdown"
+                    )
+                except Exception:
+                    pass
 
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
