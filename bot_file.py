@@ -4898,7 +4898,7 @@ async def run_sched_group_loop(bot, group_id: int, user_id: int):
 
     # جلب بيانات المجموعة من DB
     g = c_main.execute(
-        "SELECT platform, game_name, game_pkg, game_key, events_order, interval_minutes, gaid, af_uid, status FROM sched_groups WHERE id = ?",
+        "SELECT platform, game_name, game_pkg, game_key, events_order, interval_minutes, gaid, af_uid, status, game_id FROM sched_groups WHERE id = ?",
         (group_id,)
     ).fetchone()
     if not g or g[8] != 'active':
@@ -4906,7 +4906,7 @@ async def run_sched_group_loop(bot, group_id: int, user_id: int):
             sched_active_tasks.pop(group_id, None)
         return
 
-    platform, game_name, game_pkg, game_key, events_order_raw, interval, gaid, af_uid, _ = g
+    platform, game_name, game_pkg, game_key, events_order_raw, interval, gaid, af_uid, _, game_id = g
     try:
         events = json.loads(events_order_raw)
     except Exception:
@@ -4914,11 +4914,114 @@ async def run_sched_group_loop(bot, group_id: int, user_id: int):
             sched_active_tasks.pop(group_id, None)
         return
 
+    # اكتشاف الفورمات: مخصص (list of dicts) أم قديم (list of [id, name])
+    is_custom = events and isinstance(events[0], dict) and "level" in events[0]
     proxy = get_proxy_for_user(user_id)
-    interval_seconds = interval * 60  # 0 = فوري، >0 = انتظر بين الأحداث
+    interval_seconds = interval * 60  # 0 = فوري، -1 = مخصص لكل لفل، >0 = موحّد
 
-    # ===== إرسال الأحداث بالترتيب مع فاصل زمني بينها =====
-    for ev_index, (ev_id, ev_name) in enumerate(events):
+    # ===== دالة مساعدة: انتظار مع عداد تنازلي =====
+    async def wait_with_countdown(wait_min: float, label: str) -> bool:
+        """ينتظر wait_min دقيقة مع عداد. يُرجع False إذا تم الإيقاف."""
+        if wait_min <= 0:
+            await asyncio.sleep(0.5)
+            return True
+        wait_sec = wait_min * 60
+        update_every = 10 if wait_sec <= 120 else 30
+        if wait_min < 60:
+            interval_label = f"{int(wait_min)} دقيقة" if wait_min == int(wait_min) else f"{wait_min:.1f} دقيقة"
+        else:
+            h = wait_min / 60
+            interval_label = f"{int(h)} ساعة" if h == int(h) else f"{h:.1f} ساعة"
+        try:
+            cdmsg = await bot.send_message(
+                chat_id=user_id,
+                text=f"⏳ *{label}*\nيُرسل خلال {interval_label}...",
+                parse_mode="Markdown"
+            )
+        except Exception:
+            cdmsg = None
+        elapsed = 0
+        while elapsed < wait_sec:
+            await asyncio.sleep(update_every)
+            elapsed += update_every
+            status_row = c_main.execute("SELECT status FROM sched_groups WHERE id = ?", (group_id,)).fetchone()
+            if not status_row or status_row[0] != 'active':
+                if cdmsg:
+                    try: await cdmsg.edit_text("⏹ *تم إيقاف الجدولة*", parse_mode="Markdown")
+                    except Exception: pass
+                with sched_tasks_lock:
+                    sched_active_tasks.pop(group_id, None)
+                return False
+            remaining = max(0, wait_sec - elapsed)
+            if remaining == 0:
+                break
+            if cdmsg:
+                rm = int(remaining // 60)
+                rs = int(remaining % 60)
+                try:
+                    await cdmsg.edit_text(
+                        f"⏳ *{label}*\nيُرسل خلال {rm}د {rs:02d}ث",
+                        parse_mode="Markdown"
+                    )
+                except Exception:
+                    pass
+        if cdmsg:
+            try: await cdmsg.delete()
+            except Exception: pass
+        return True
+
+    # ===== دالة مساعدة: إرسال الحدث =====
+    async def send_event(ev_label: str, ev_id_or_level) -> tuple:
+        """يرسل الحدث حسب المنصة. يُرجع (status_code, resp)."""
+        sc, rs = 0, ""
+        try:
+            if is_custom:
+                level_num = ev_id_or_level
+                if platform == "adj":
+                    ev_row = c_main.execute(
+                        "SELECT event_token FROM events_adj WHERE game_id = ? ORDER BY ABS(COALESCE(level_value,0) - ?) LIMIT 1",
+                        (game_id, level_num)
+                    ).fetchone()
+                    if not ev_row:
+                        ev_row = c_main.execute("SELECT event_token FROM events_adj WHERE game_id = ? LIMIT 1", (game_id,)).fetchone()
+                    if ev_row:
+                        sc, rs = await loop.run_in_executor(None, lambda t=ev_row[0]: send_adj(game_key, t, gaid, proxy))
+                elif platform == "singular":
+                    ev_row = c_main.execute(
+                        "SELECT event_name FROM events_singular WHERE game_id = ? LIMIT 1", (game_id,)
+                    ).fetchone()
+                    if ev_row:
+                        custom_name = re.sub(r'\d+', str(level_num), ev_row[0]) if re.search(r'\d+', ev_row[0]) else f"level_{level_num}"
+                        sc, rs = await loop.run_in_executor(None, lambda e=custom_name: send_singular(e, gaid, af_uid, game_pkg, game_key, proxy=proxy))
+                else:  # af
+                    ev_row = c_main.execute(
+                        "SELECT event_name FROM events_af WHERE game_id = ? AND event_type='level' LIMIT 1", (game_id,)
+                    ).fetchone()
+                    if not ev_row:
+                        ev_row = c_main.execute("SELECT event_name FROM events_af WHERE game_id = ? LIMIT 1", (game_id,)).fetchone()
+                    if ev_row:
+                        custom_name = re.sub(r'\d+', str(level_num), ev_row[0]) if re.search(r'\d+', ev_row[0]) else f"af_level_{level_num}_achieved"
+                        sc, rs = await loop.run_in_executor(None, lambda e=custom_name: send_af(game_pkg, game_key, gaid, af_uid, e, proxy=proxy))
+            else:
+                ev_id = ev_id_or_level
+                if platform == "adj":
+                    ev_row = c_main.execute("SELECT event_token FROM events_adj WHERE id = ?", (ev_id,)).fetchone()
+                    if ev_row:
+                        sc, rs = await loop.run_in_executor(None, lambda t=ev_row[0]: send_adj(game_key, t, gaid, proxy))
+                elif platform == "singular":
+                    ev_row = c_main.execute("SELECT event_name FROM events_singular WHERE id = ?", (ev_id,)).fetchone()
+                    if ev_row:
+                        sc, rs = await loop.run_in_executor(None, lambda e=ev_row[0]: send_singular(e, gaid, af_uid, game_pkg, game_key, proxy=proxy))
+                else:
+                    ev_row = c_main.execute("SELECT event_name FROM events_af WHERE id = ?", (ev_id,)).fetchone()
+                    if ev_row:
+                        sc, rs = await loop.run_in_executor(None, lambda e=ev_row[0]: send_af(game_pkg, game_key, gaid, af_uid, e, proxy=proxy))
+        except Exception as ex:
+            sc, rs = 0, str(ex)
+        return sc, rs
+
+    # ===== إرسال الأحداث بالترتيب =====
+    for ev_index, entry in enumerate(events):
         # تحقق إذا تم الإيقاف
         status_row = c_main.execute("SELECT status FROM sched_groups WHERE id = ?", (group_id,)).fetchone()
         if not status_row or status_row[0] != 'active':
@@ -4926,43 +5029,48 @@ async def run_sched_group_loop(bot, group_id: int, user_id: int):
                 sched_active_tasks.pop(group_id, None)
             return
 
+        if is_custom:
+            level_num = entry["level"]
+            ev_wait_min = entry["interval"]
+            ev_label = f"LV{level_num}"
+            ev_key = level_num
+        else:
+            ev_id, ev_name = entry[0], entry[1]
+            ev_wait_min = 0 if interval_seconds == 0 else (interval if ev_index > 0 else 0)
+            ev_label = ev_name
+            ev_key = ev_id
+
+        # --- انتظار الفاصل الزمني قبل الإرسال ---
+        if ev_wait_min > 0:
+            ok = await wait_with_countdown(ev_wait_min, f"اللفل التالي: {ev_label}")
+            if not ok:
+                return
+        elif not is_custom and ev_index > 0 and interval_seconds > 0:
+            ok = await wait_with_countdown(interval, ev_label)
+            if not ok:
+                return
+
+        # تحقق مجدداً بعد الانتظار
+        status_row = c_main.execute("SELECT status FROM sched_groups WHERE id = ?", (group_id,)).fetchone()
+        if not status_row or status_row[0] != 'active':
+            with sched_tasks_lock:
+                sched_active_tasks.pop(group_id, None)
+            return
+
         # --- إرسال الحدث ---
-        status_code = 0
-        resp = ""
-        try:
-            if platform == "adj":
-                ev_row = c_main.execute("SELECT event_token FROM events_adj WHERE id = ?", (ev_id,)).fetchone()
-                if ev_row:
-                    status_code, resp = await loop.run_in_executor(
-                        None, lambda t=ev_row[0]: send_adj(game_key, t, gaid, proxy)
-                    )
-            elif platform == "singular":
-                ev_row = c_main.execute("SELECT event_name FROM events_singular WHERE id = ?", (ev_id,)).fetchone()
-                if ev_row:
-                    status_code, resp = await loop.run_in_executor(
-                        None, lambda e=ev_row[0]: send_singular(e, gaid, af_uid, game_pkg, game_key, proxy=proxy)
-                    )
-            else:  # af
-                ev_row = c_main.execute("SELECT event_name FROM events_af WHERE id = ?", (ev_id,)).fetchone()
-                if ev_row:
-                    status_code, resp = await loop.run_in_executor(
-                        None, lambda e=ev_row[0]: send_af(game_pkg, game_key, gaid, af_uid, e, proxy=proxy)
-                    )
-        except Exception as ex:
-            status_code = 0
-            resp = str(ex)
+        status_code, resp = await send_event(ev_label, ev_key)
 
         # --- إشعار بنتيجة الإرسال ---
         result_emoji = "✅" if status_code == 200 else "❌"
         remaining_count = len(events) - ev_index - 1
-        remaining_text = f"\n⏭ *متبقي:* `{remaining_count} حدث`" if remaining_count > 0 else ""
+        remaining_text = f"\n⏭ *متبقي:* `{remaining_count} لفل`" if remaining_count > 0 else ""
         try:
             await bot.send_message(
                 chat_id=user_id,
                 text=(
                     f"{result_emoji} *إرسال تلقائي*\n\n"
                     f"🎮 *اللعبة:* `{game_name}`\n"
-                    f"🎯 *الحدث:* `{ev_name}`\n"
+                    f"🎯 *الحدث:* `{ev_label}`\n"
                     f"🔹 *المنصة:* `{platform.upper()}`\n"
                     f"📱 *GAID:* `{gaid}`\n"
                     f"🔑 *AF UID:* `{af_uid}`\n"
@@ -4976,71 +5084,16 @@ async def run_sched_group_loop(bot, group_id: int, user_id: int):
         except Exception:
             pass
 
-        # --- فاصل زمني مع عداد تنازلي بين الأحداث (ما عدا الأخير) ---
-        if ev_index < len(events) - 1:
-            if interval_seconds == 0:
-                # وضع فوري: لا انتظار
-                await asyncio.sleep(0.5)
-            else:
-                # عرض العداد التنازلي حتى الحدث التالي
-                next_ev_name = events[ev_index + 1][1]
-                if interval < 60:
-                    interval_label = f"{interval} دقيقة"
-                else:
-                    interval_label = f"{interval // 60} ساعة"
-
-                try:
-                    countdown_msg = await bot.send_message(
-                        chat_id=user_id,
-                        text=f"⏳ *الحدث التالي:* `{next_ev_name}`\nيُرسل خلال {interval_label}...",
-                        parse_mode="Markdown"
-                    )
-                except Exception:
-                    countdown_msg = None
-
-                # تحديث العداد كل 10 ثواني (للفترات القصيرة) أو 30 ثانية (للطويلة)
-                update_every = 10 if interval_seconds <= 120 else 30
-                elapsed = 0
-                while elapsed < interval_seconds:
-                    await asyncio.sleep(update_every)
-                    elapsed += update_every
-
-                    # تحقق إذا تم الإيقاف أثناء الانتظار
-                    status_row = c_main.execute("SELECT status FROM sched_groups WHERE id = ?", (group_id,)).fetchone()
-                    if not status_row or status_row[0] != 'active':
-                        if countdown_msg:
-                            try:
-                                await countdown_msg.edit_text("⏹ *تم إيقاف الجدولة*", parse_mode="Markdown")
-                            except Exception:
-                                pass
-                        with sched_tasks_lock:
-                            sched_active_tasks.pop(group_id, None)
-                        return
-
-                    remaining = max(0, interval_seconds - elapsed)
-                    if remaining == 0:
-                        break
-                    if countdown_msg:
-                        remaining_min = remaining // 60
-                        remaining_sec = remaining % 60
-                        try:
-                            await countdown_msg.edit_text(
-                                f"⏳ *الحدث التالي:* `{next_ev_name}`\n"
-                                f"يُرسل خلال {remaining_min}د {remaining_sec:02d}ث",
-                                parse_mode="Markdown"
-                            )
-                        except Exception:
-                            pass
-
-                if countdown_msg:
-                    try:
-                        await countdown_msg.delete()
-                    except Exception:
-                        pass
+        # وضع فوري (قديم): فاصل 0.5ث بين الأحداث
+        if not is_custom and interval_seconds == 0 and ev_index < len(events) - 1:
+            await asyncio.sleep(0.5)
 
     # ===== اكتمال جميع الأحداث: إشعار وإيقاف تلقائي =====
     try:
-        events_summary = "\n".join([f"{i+1}. {e[1]}" for i, e in enumerate(events)])
+        if is_custom:
+            events_summary = "\n".join([f"{i+1}. LV{e['level']}" for i, e in enumerate(events)])
+        else:
+            events_summary = "\n".join([f"{i+1}. {e[1]}" for i, e in enumerate(events)])
         await bot.send_message(
             chat_id=user_id,
             text=(
@@ -5185,7 +5238,69 @@ async def sched_game_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data["sched"]["all_events"] = ev_list
     context.user_data["sched"]["selected_events"] = []
-    return await sched_show_events(update, context)
+    return await sched_ask_levels(update, context)
+
+def parse_level_time(time_str: str) -> float:
+    """تحويل نص الوقت (1h, 0.5h, 30m) إلى دقائق"""
+    s = time_str.strip().lower()
+    if s in ('0', '0h', '0m'):
+        return 0.0
+    if s.endswith('h'):
+        return float(s[:-1]) * 60
+    if s.endswith('m'):
+        return float(s[:-1])
+    return float(s)
+
+async def sched_ask_levels(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    sched = context.user_data["sched"]
+    game_name = sched["game_name"]
+    platform = sched["platform"]
+    text = (
+        f"🎮 *{game_name}* | *{platform.upper()}*\n\n"
+        f"أرسل اللفلات مع الفاصل الزمني — كل سطر لفل واحد:\n\n"
+        f"`LV15/1h`\n`LV17/2h`\n`LV18/0.5h`\n`LV19/0.25h`\n\n"
+        f"📌 صيغ الوقت: `1h` ساعة · `0.5h` نصف ساعة · `30m` دقيقة · `0` فوري"
+    )
+    try:
+        await query.edit_message_text(text, parse_mode="Markdown")
+    except Exception:
+        await query.message.reply_text(text, parse_mode="Markdown")
+    return "SCHED_LEVELS"
+
+async def sched_levels_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    sched = context.user_data["sched"]
+    entries = []
+    errors = []
+    for i, line in enumerate(text.split('\n'), 1):
+        line = line.strip()
+        if not line:
+            continue
+        m = re.match(r'^[Ll][Vv](\d+)/(.+)$', line)
+        if not m:
+            errors.append(f"سطر {i}: `{line}` — صيغة خاطئة")
+            continue
+        level_num = int(m.group(1))
+        try:
+            interval_min = parse_level_time(m.group(2))
+        except ValueError:
+            errors.append(f"سطر {i}: وقت غير صحيح `{m.group(2)}`")
+            continue
+        entries.append({"level": level_num, "interval": interval_min})
+    if errors:
+        await update.message.reply_text(
+            "❌ *أخطاء في الصيغة:*\n" + "\n".join(errors) + "\n\nأعد الإرسال.",
+            parse_mode="Markdown"
+        )
+        return "SCHED_LEVELS"
+    if not entries:
+        await update.message.reply_text("❌ لم يتم إدخال أي لفل. أعد الإرسال.", parse_mode="Markdown")
+        return "SCHED_LEVELS"
+    sched["custom_levels"] = entries
+    sched["interval"] = -1
+    await update.message.reply_text("📱 *أدخل GAID:*\n\nمثال: `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`", parse_mode="Markdown")
+    return "SCHED_GAID"
 
 async def sched_show_events(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -5282,18 +5397,28 @@ async def sched_afuid_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     platform = sched["platform"]
     game_name = sched["game_name"]
-    events = sched["selected_events"]
-    interval = sched["interval"]
     gaid = sched["gaid"]
 
-    if interval == 0:
-        interval_text = "فوري (بدون فاصل)"
-    elif interval < 60:
-        interval_text = f"{interval} دقيقة"
+    if sched.get("custom_levels"):
+        entries = sched["custom_levels"]
+        def fmt_interval(m):
+            if m == 0:
+                return "فوري"
+            if m < 60:
+                return f"{int(m)}د"
+            return f"{m/60:.1f}س".rstrip('0').rstrip('.')+"س" if '.' in f"{m/60:.1f}" else f"{int(m//60)}س"
+        events_text = "\n".join([f"{i+1}. LV{e['level']} ← بعد {fmt_interval(e['interval'])}" for i, e in enumerate(entries)])
+        interval_text = "مخصص لكل لفل"
     else:
-        interval_text = f"{interval // 60} ساعة"
-
-    events_text = "\n".join([f"{i+1}. {e[1]}" for i, e in enumerate(events)])
+        events = sched["selected_events"]
+        interval = sched["interval"]
+        if interval == 0:
+            interval_text = "فوري (بدون فاصل)"
+        elif interval < 60:
+            interval_text = f"{interval} دقيقة"
+        else:
+            interval_text = f"{interval // 60} ساعة"
+        events_text = "\n".join([f"{i+1}. {e[1]}" for i, e in enumerate(events)])
 
     kb = [
         [InlineKeyboardButton("✅ تأكيد وتشغيل", callback_data="sched_confirm")],
@@ -5303,7 +5428,7 @@ async def sched_afuid_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📋 *تفاصيل الخطة:*\n\n"
         f"🔹 *المنصة:* `{platform.upper()}`\n"
         f"🎮 *اللعبة:* `{game_name}`\n"
-        f"🎯 *الأحداث بالترتيب:*\n{events_text}\n"
+        f"🎯 *اللفلات بالترتيب:*\n{events_text}\n"
         f"⏰ *الفاصل الزمني:* `{interval_text}`\n"
         f"📱 *GAID:* `{gaid}`\n"
         f"🔑 *AF UID:* `{af_uid}`",
@@ -5323,12 +5448,16 @@ async def sched_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     game_name = sched["game_name"]
     game_pkg = sched["game_pkg"]
     game_key = sched["game_key"]
-    events = sched["selected_events"]
-    interval = sched["interval"]
     gaid = sched["gaid"]
     af_uid = sched["af_uid"]
 
-    events_order = json.dumps([(e[0], e[1]) for e in events], ensure_ascii=False)
+    if sched.get("custom_levels"):
+        events_order = json.dumps(sched["custom_levels"], ensure_ascii=False)
+        interval = -1
+    else:
+        events = sched["selected_events"]
+        interval = sched["interval"]
+        events_order = json.dumps([(e[0], e[1]) for e in events], ensure_ascii=False)
     now = datetime.now().isoformat()
 
     c_main.execute(
@@ -5364,7 +5493,7 @@ async def sched_my_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for g in groups:
         gid, platform, game_name, events_order, interval, gaid, af_uid, status, next_run = g
         status_emoji = "🟢" if status == "active" else "🔴"
-        interval_text = "فوري" if interval == 0 else (f"{interval}د" if interval < 60 else f"{interval // 60}س")
+        interval_text = "فوري" if interval == 0 else ("مخصص" if interval == -1 else (f"{interval}د" if interval < 60 else f"{interval // 60}س"))
         kb.append([InlineKeyboardButton(
             f"{status_emoji} [{gid}] {game_name} ({platform.upper()}) {interval_text}",
             callback_data=f"sched_group_info_{gid}"
@@ -5392,11 +5521,17 @@ async def sched_group_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     gid, platform, game_name, events_order_raw, interval, gaid, af_uid, status, next_run = g
     try:
         events = json.loads(events_order_raw)
-        events_text = "\n".join([f"{i+1}. {e[1]}" for i, e in enumerate(events)])
+        if events and isinstance(events[0], dict) and "level" in events[0]:
+            def _fmt(m):
+                if m == 0: return "فوري"
+                return f"{int(m)}د" if m < 60 else f"{m/60:.1f}س"
+            events_text = "\n".join([f"{i+1}. LV{e['level']} ← بعد {_fmt(e['interval'])}" for i, e in enumerate(events)])
+        else:
+            events_text = "\n".join([f"{i+1}. {e[1]}" for i, e in enumerate(events)])
     except Exception:
         events_text = events_order_raw
 
-    interval_text = "فوري (بدون فاصل)" if interval == 0 else (f"{interval} دقيقة" if interval < 60 else f"{interval // 60} ساعة")
+    interval_text = "فوري (بدون فاصل)" if interval == 0 else ("مخصص لكل لفل" if interval == -1 else (f"{interval} دقيقة" if interval < 60 else f"{interval // 60} ساعة"))
     status_text = "🟢 نشطة" if status == "active" else "🔴 متوقفة"
     next_run_short = next_run[:16] if next_run else "-"
 
@@ -5565,6 +5700,9 @@ def main():
             "SCHED_GAME": [
                 CallbackQueryHandler(sched_game_select, pattern=r"^sched_game_\d+$"),
                 CallbackQueryHandler(sched_new, pattern="^sched_new$"),
+            ],
+            "SCHED_LEVELS": [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, sched_levels_input),
             ],
             "SCHED_EVENTS": [
                 CallbackQueryHandler(sched_event_toggle, pattern=r"^sched_ev_\d+$"),
